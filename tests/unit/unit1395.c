@@ -142,6 +142,33 @@ static CURLcode test_unit1395(const char *arg)
     { "%2ewell-known", NULL },
     { "%2Ewell-known", NULL },
     { "../.well-known", ".well-known" },
+    /* every amount and arrangement of leading dot segments is removed the
+       same way, whether spelled with a literal dot or with %2e/%2E */
+    { "././a", "a" },
+    { "./././a", "a" },
+    { ".././a", "a" },
+    { "./../a", "a" },
+    { "../../a", "a" },
+    { "../../../a", "a" },
+    { "%2e/%2e/a", "a" },
+    { "%2E/%2e/a", "a" },
+    { "%2e%2e/%2e%2e/a", "a" },
+    { "%2e%2e/%2E%2e/a", "a" },
+    { "%2e./a", "a" },
+    { ".%2e/a", "a" },
+    { "././", "" },
+    { ".././", "" },
+    { "../../", "" },
+    { "./.", "" },
+    { "../..", "" },
+    { "%2e/%2e/", "" },
+    { "%2e%2e/%2e", "" },
+    { "././x/../y", "x/y" },
+    { "../../a/b/../c", "a/c" },
+    /* not complete dot segments, so left alone */
+    { "..a", NULL },
+    { ".hidden", NULL },
+    { "%2e%2e%2e/a", "%2e%2e%2e/a" },
   };
 
   for(i = 0; i < CURL_ARRAYSIZE(pairs); i++) {

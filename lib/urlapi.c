@@ -838,37 +838,56 @@ UNITTEST int dedotdotify(const char *input, size_t clen, char **outp)
   struct dynbuf out;
   CURLcode result = CURLE_OK;
 
-  /* variables for leading dot checks */
-  const char *dinput = input;
-  size_t dlen = clen;
-
   *outp = NULL;
   if(!needs_dedotdot(input, clen))
     return 0;
 
   curlx_dyn_init(&out, clen + 1);
 
-  /* if the input buffer begins with a prefix of "../" or "./", then remove
-     that prefix from the input buffer; otherwise, */
-  if(is_dot(&dinput, &dlen)) {
+  /* RFC 3986 section 5.2.4 step A (and step D for a buffer that is only a dot
+     or dotdot): while the input buffer begins with a complete "." or ".."
+     path segment, drop that segment. This has to be repeated so that any
+     amount of leading dot segments is removed, no matter how the input is
+     arranged, e.g. "././x", "../../x" and their percent-encoded spellings
+     like "%2e/%2e/x" and "%2e%2e/%2e%2e/x" all end up the same. is_dot()
+     treats "%2e" and "%2E" exactly like a literal "." so encoding does not
+     change the outcome. Anything that is not a complete dot segment, like
+     "..a" or ".hidden", is left for the loop below. */
+  while(clen) {
+    const char *dinput = input;
+    size_t dlen = clen;
+
+    if(!is_dot(&dinput, &dlen))
+      break;
+    if(!dlen) {
+      /* "." */
+      input = dinput;
+      clen = 0;
+      break;
+    }
     if(ISSLASH(*dinput)) {
-      /* one dot followed by a slash */
+      /* "./" */
       input = dinput + 1;
       clen = dlen - 1;
+      continue;
     }
-
-    /* if the input buffer consists only of "." or "..", then remove
-       that from the input buffer; otherwise, */
-    else if(is_dot(&dinput, &dlen)) {
-      if(!dlen)
-        /* .. [end] */
-        goto end;
-      else if(ISSLASH(*dinput)) {
-        /* ../ */
-        input = dinput + 1;
-        clen = dlen - 1;
-      }
+    if(!is_dot(&dinput, &dlen))
+      /* not ".." */
+      break;
+    if(!dlen) {
+      /* ".." */
+      input = dinput;
+      clen = 0;
+      break;
     }
+    if(ISSLASH(*dinput)) {
+      /* "../" */
+      input = dinput + 1;
+      clen = dlen - 1;
+      continue;
+    }
+    /* "..x" and similar */
+    break;
   }
 
   while(clen && !result) { /* until end of path content */
@@ -928,7 +947,6 @@ UNITTEST int dedotdotify(const char *input, size_t clen, char **outp)
     input += seglen;
     clen -= seglen;
   }
-end:
   if(!result) {
     if(curlx_dyn_len(&out))
       *outp = curlx_dyn_ptr(&out);
