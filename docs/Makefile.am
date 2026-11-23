@@ -57,6 +57,7 @@ INTERNALDOCS =                                   \
   internals/CURLX.md                             \
   internals/DYNBUF.md                            \
   internals/HASH.md                              \
+  internals/HTTP2-STREAM-RESET.md                \
   internals/LLIST.md                             \
   internals/MID.md                               \
   internals/MQTT.md                              \

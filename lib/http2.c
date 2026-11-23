@@ -137,6 +137,7 @@ struct h2_stream_ctx {
   uint32_t mid; /* transfer `mid` owning this stream */
   uint32_t error; /* stream error code */
   CURLcode xfer_result; /* Result of writing out response */
+  CURLcode close_result; /* result reported once the closure is handled */
   int32_t local_window_size; /* the local recv window size */
   int32_t status_code; /* HTTP response status code */
   BIT(resp_hds_complete); /* we have a complete, final response */
@@ -159,6 +160,30 @@ static void free_push_headers(struct h2_stream_ctx *stream)
   stream->push_headers_used = 0;
 }
 
+/* Release all per-stream resources that are only needed while the stream is
+ * active: leftover request bytes, response trailers and pushed headers.
+ * Safe to call more than once and on a partially initialized stream, so that
+ * error paths can always scrub what they may have allocated without tracking
+ * how far they got. The stream itself stays alive until it is removed from
+ * `ctx->streams`.
+ *
+ * `free_push` must be FALSE for streams of pushed transfers: their
+ * PUSH_PROMISE headers belong to the application callback path and are
+ * released by that path via `free_push_headers()`.
+ */
+static void h2_stream_scratch_cleanup(struct h2_stream_ctx *stream,
+                                      bool free_push)
+{
+  if(!stream)
+    return;
+  Curl_bufq_reset(&stream->sendbuf);
+  Curl_h1_req_parse_free(&stream->h1);
+  Curl_dynhds_cleanup(&stream->resp_trailers);
+  if(free_push)
+    free_push_headers(stream);
+  stream->body_eos = FALSE;
+}
+
 static void h2_stream_ctx_free(struct h2_stream_ctx *stream)
 {
   Curl_bufq_free(&stream->sendbuf);
@@ -173,6 +198,84 @@ static void h2_stream_hash_free(uint32_t id, void *stream)
   (void)id;
   DEBUGASSERT(stream);
   h2_stream_ctx_free((struct h2_stream_ctx *)stream);
+}
+
+/* The one place that decides what a closing HTTP/2 stream means for the
+ * transfer owning it. The rule, in evaluation order:
+ *
+ * 1. `!reset`: the stream was closed without an error. If the response body
+ *    processing ever started (`bodystarted`), this is a normal end of
+ *    response. Otherwise we were closed before a complete set of response
+ *    headers arrived: an error, because no response can be delivered.
+ * 2. `reset` with `NGHTTP2_REFUSED_STREAM`: the server did not process the
+ *    request. The transfer may be retried on a new connection; whether that
+ *    is safe is decided by the caller from the bytes already received.
+ * 3. `reset` after a complete response header and with `no_body`
+ *    (`HEAD`, or a body that the user does not want): the reset is a
+ *    consequence of us not reading more, ignore it.
+ * 4. every other reset: an error. With a non-zero error code this is
+ *    `CURLE_HTTP2_STREAM`, otherwise `CURLE_PARTIAL_FILE` when body bytes
+ *    were delivered and `CURLE_HTTP2` when none were.
+ *
+ * Only case 2 closes the connection: the server says it did not process the
+ * request, so the request is retried on a fresh connection. A plain stream
+ * failure in case 4 leaves the multiplexed connection untouched, other
+ * transfers on it are unaffected. The remaining cases keep the connection
+ * as well.
+ *
+ * A NULL `sp` is treated as "nothing is known", i.e. evaluated like an
+ * all-zero, non-reset state that has not started a body. The function never
+ * modifies its input.
+ *
+ * @unittest 3308
+ */
+UNITTEST struct h2_close_verdict h2_eval_stream_close(
+  const struct h2_close_state *sp);
+UNITTEST struct h2_close_verdict h2_eval_stream_close(
+  const struct h2_close_state *sp)
+{
+  static const struct h2_close_state empty;
+  const struct h2_close_state *s = sp ? sp : &empty;
+  struct h2_close_verdict v;
+
+  v.result = CURLE_OK;
+  v.conn = H2_CONN_KEEP;
+  if(!s->reset) {
+    if(s->bodystarted)
+      v.action = H2_CLOSE_COMPLETE;
+    else {
+      v.action = H2_CLOSE_ERROR;
+      v.result = CURLE_HTTP2_STREAM;
+    }
+  }
+  else if(s->error == NGHTTP2_REFUSED_STREAM) {
+    v.action = H2_CLOSE_REFUSED;
+    v.conn = H2_CONN_CLOSE;
+    v.result = CURLE_RECV_ERROR; /* trigger Curl_retry_request() later */
+  }
+  else if(s->resp_hds_complete && s->no_body) {
+    v.action = H2_CLOSE_IGNORED;
+  }
+  else {
+    v.action = H2_CLOSE_ERROR;
+    v.result = s->error ? CURLE_HTTP2_STREAM :
+      (s->has_data ? CURLE_PARTIAL_FILE : CURLE_HTTP2);
+  }
+  return v;
+}
+
+/* Fill a close state from `stream` and the owning transfer. */
+static void h2_stream_close_state(struct Curl_easy *data,
+                                  struct h2_stream_ctx *st,
+                                  struct h2_close_state *s)
+{
+  memset(s, 0, sizeof(*s));
+  s->error = st->error;
+  s->reset = st->reset;
+  s->resp_hds_complete = st->resp_hds_complete;
+  s->bodystarted = st->bodystarted;
+  s->no_body = data->req.no_body;
+  s->has_data = !!data->req.bytecount;
 }
 
 static void cf_h2_ctx_init(struct cf_h2_ctx *ctx, bool via_h1_upgrade)
@@ -469,6 +572,12 @@ static void http2_data_done(struct Curl_cfilter *cf, struct Curl_easy *data)
       (void)nw_out_flush(cf, data);
     }
   }
+
+  /* The transfer is done with this stream. Whatever partial request or
+   * response state was still buffered per stream is not needed anymore.
+   * `push_headers` is deliberately kept: for a pushed transfer the
+   * PUSH_PROMISE data is owned by the callback path and released there. */
+  h2_stream_scratch_cleanup(stream, FALSE);
 
   Curl_u32_ptrset_unset(&ctx->streams, data->mid);
 }
@@ -1719,77 +1828,110 @@ static CURLcode http2_handle_stream_close(struct Curl_cfilter *cf,
                                           struct h2_stream_ctx *stream,
                                           size_t *pnlen)
 {
+  struct h2_close_verdict v;
   CURLcode result;
 
   *pnlen = 0;
-  if(stream->close_handled)
-    return CURLE_OK;
-
-  if(stream->reset) {
-    if(stream->error == NGHTTP2_REFUSED_STREAM) {
-      infof(data, "HTTP/2 stream %d refused by server, try again on a new "
-                  "connection", stream->id);
-      connclose(CF_CONN(cf)); /* do not use this anymore */
-      data->req.refused_stream = TRUE;
-      return CURLE_RECV_ERROR; /* trigger Curl_retry_request() later */
-    }
-    else if(stream->resp_hds_complete && data->req.no_body) {
-      CURL_TRC_CF(data, cf, "[%d] error after response headers, but we did "
-                  "not want a body anyway, ignore: %s (err %u)",
-                  stream->id, nghttp2_http2_strerror(stream->error),
-                  stream->error);
-      stream->close_handled = TRUE;
-      return CURLE_OK;
-    }
-    failf(data, "HTTP/2 stream %d reset by %s (error 0x%x %s)",
-          stream->id, stream->reset_by_server ? "server" : "curl",
-          stream->error, nghttp2_http2_strerror(stream->error));
-    return stream->error ? CURLE_HTTP2_STREAM :
-           (data->req.bytecount ? CURLE_PARTIAL_FILE : CURLE_HTTP2);
-  }
-  else if(!stream->bodystarted) {
-    failf(data, "HTTP/2 stream %d was closed cleanly, but before getting "
-          "all response header fields, treated as error", stream->id);
-    return CURLE_HTTP2_STREAM;
+  if(stream->close_handled) {
+    /* The closure was already processed. This happens when several places
+     * observe the same closed stream before the transfer is finished. Report
+     * the very same outcome again, so callers see a stable state. */
+    result = stream->close_result;
+    CURL_TRC_CF(data, cf, "[%d] handle_stream_close, already handled -> %d",
+                stream->id, (int)result);
+    return result;
   }
 
-  if(Curl_dynhds_count(&stream->resp_trailers)) {
-    struct dynhds_entry *e;
-    struct dynbuf dbuf;
-    uint32_t i, ntrailers = Curl_dynhds_count(&stream->resp_trailers);
+  {
+    struct h2_close_state s;
+    h2_stream_close_state(data, stream, &s);
+    v = h2_eval_stream_close(&s);
+  }
+  result = v.result;
 
-    result = CURLE_OK;
-    curlx_dyn_init(&dbuf, DYN_TRAILERS);
-    for(i = 0; !result && (i < ntrailers); ++i) {
-      e = Curl_dynhds_getn(&stream->resp_trailers, i);
-      if(!e)
-        break;
-      curlx_dyn_reset(&dbuf);
-      result = curlx_dyn_addf(&dbuf, "%.*s: %.*s\x0d\x0a",
-                              (int)e->namelen, e->name,
-                              (int)e->valuelen, e->value);
-      if(result)
-        break;
-      Curl_debug(data, CURLINFO_HEADER_IN, curlx_dyn_ptr(&dbuf),
-                 curlx_dyn_len(&dbuf));
-      result = Curl_client_write(data,
-                                 CLIENTWRITE_HEADER | CLIENTWRITE_TRAILER,
-                                 curlx_dyn_ptr(&dbuf), curlx_dyn_len(&dbuf));
-      if(result)
-        break;
-      result = Curl_bump_headersize(data, curlx_dyn_len(&dbuf), FALSE);
-      if(result)
-        break;
-    }
-    curlx_dyn_free(&dbuf);
-    if(result)
-      goto out;
+  switch(v.action) {
+  case H2_CLOSE_REFUSED:
+    infof(data, "HTTP/2 stream %d refused by server, try again on a new "
+                "connection", stream->id);
+    data->req.refused_stream = TRUE;
+    break;
+
+  case H2_CLOSE_IGNORED:
+    CURL_TRC_CF(data, cf, "[%d] error after response headers, but we did "
+                "not want a body anyway, ignore: %s (err %u)",
+                stream->id, nghttp2_http2_strerror(stream->error),
+                stream->error);
+    break;
+
+  case H2_CLOSE_ERROR:
+    if(stream->reset)
+      failf(data, "HTTP/2 stream %d reset by %s (error 0x%x %s)",
+            stream->id, stream->reset_by_server ? "server" : "curl",
+            stream->error, nghttp2_http2_strerror(stream->error));
+    else
+      failf(data, "HTTP/2 stream %d was closed cleanly, but before getting "
+            "all response header fields, treated as error", stream->id);
+    break;
+
+  case H2_CLOSE_COMPLETE:
+  default:
+    /* fall through to trailer delivery below */
+    break;
   }
 
+  if(v.action == H2_CLOSE_COMPLETE) {
+    if(Curl_dynhds_count(&stream->resp_trailers)) {
+      struct dynhds_entry *e;
+      struct dynbuf dbuf;
+      uint32_t i, ntrailers = Curl_dynhds_count(&stream->resp_trailers);
+
+      result = CURLE_OK;
+      curlx_dyn_init(&dbuf, DYN_TRAILERS);
+      for(i = 0; !result && (i < ntrailers); ++i) {
+        e = Curl_dynhds_getn(&stream->resp_trailers, i);
+        if(!e)
+          break;
+        curlx_dyn_reset(&dbuf);
+        result = curlx_dyn_addf(&dbuf, "%.*s: %.*s\x0d\x0a",
+                                (int)e->namelen, e->name,
+                                (int)e->valuelen, e->value);
+        if(result)
+          break;
+        Curl_debug(data, CURLINFO_HEADER_IN, curlx_dyn_ptr(&dbuf),
+                   curlx_dyn_len(&dbuf));
+        result = Curl_client_write(data,
+                                   CLIENTWRITE_HEADER | CLIENTWRITE_TRAILER,
+                                   curlx_dyn_ptr(&dbuf), curlx_dyn_len(&dbuf));
+        if(result)
+          break;
+        result = Curl_bump_headersize(data, curlx_dyn_len(&dbuf), FALSE);
+        if(result)
+          break;
+      }
+      curlx_dyn_free(&dbuf);
+      if(result) {
+        /* The trailers could not be delivered, the close is now an error.
+         * Remember that, since all the data has been consumed and there is
+         * nothing to retry: no later call may report success here. */
+        CURL_TRC_CF(data, cf, "[%d] trailer delivery failed -> %d",
+                    stream->id, (int)result);
+      }
+    }
+  }
+
+  /* From here on, the stream closure has been fully accounted for: remember
+   * the outcome so that any repeated call returns it unchanged. This is the
+   * single point that transitions a stream to "handled", regardless of the
+   * verdict, so no path can leave the closure half-processed. */
   stream->close_handled = TRUE;
-  result = CURLE_OK;
+  stream->close_result = result;
 
-out:
+  if(v.conn == H2_CONN_CLOSE) {
+    /* The server refused the request in a way that leaves the connection
+     * unusable for this transfer; do not hand it to anyone else. */
+    connclose(CF_CONN(cf));
+  }
+
   CURL_TRC_CF(data, cf, "handle_stream_close -> %d, %zu", (int)result, *pnlen);
   return result;
 }
@@ -2125,6 +2267,7 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
   size_t nwritten;
   CURLcode result = CURLE_OK;
   uint32_t initial_win_size;
+  bool submitted = FALSE;
 
   *pnwritten = 0;
   Curl_dynhds_init(&h2_headers, MAX_HTTP_RESP_HEADER_COUNT, DYN_HTTP_REQUEST);
@@ -2218,6 +2361,7 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
 #endif
 
   stream->id = stream_id;
+  submitted = TRUE;
 
   body = (const char *)buf + *pnwritten;
   bodylen = len - *pnwritten;
@@ -2235,6 +2379,13 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
   }
 
 out:
+  if(result && stream && !submitted) {
+    /* Submission failed before the request was handed to nghttp2: drop the
+     * scratch state collected for it, so a retry does not resume from a
+     * half-built request. Once submitted, the stream is known to nghttp2 and
+     * its state is released through the normal close/removal paths. */
+    h2_stream_scratch_cleanup(stream, TRUE);
+  }
   CURL_TRC_CF(data, cf, "[%d] submit -> %d, %zu",
               stream ? stream->id : -1, (int)result, *pnwritten);
   curlx_safefree(nva);

@@ -125,6 +125,7 @@ This release includes the following bugfixes:
  o http-proxy: reconnect on non-chunked CONNECT error framing [223]
  o http2: do not let a rate limit enlarge the stream window [66]
  o http2: fail the parent transfer on CURL_PUSH_ERROROUT [64]
+ o http2: make stream reset handling on connection reuse deterministic [319]
  o http2: refuse server push on internal handles [170]
  o http2: set initial origin for pushed streams [182]
  o http3: deliver response trailers as trailers, do not process as headers [221]
@@ -680,3 +681,4 @@ References to bug reports and discussions on issues:
  [316] = https://curl.se/bug/?i=23955
  [317] = https://curl.se/bug/?i=23982
  [318] = https://curl.se/bug/?i=23962
+ [319] = https://github.com/curl/curl/pull/24083
