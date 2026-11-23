@@ -1129,6 +1129,15 @@ CURLcode Curl_cookie_add(struct Curl_easy *data,
   iponly = curlx_strlen(&cookie.domain) ? host_is_ipnum(&cookie.domain) :
     FALSE;
 
+  if(iponly && cookie.tailmatch)
+    /*
+     * An IP-literal domain has no domain hierarchy (RFC 6265 5.1.3) and so
+     * cannot be tail-matched. A Netscape file or CURLOPT_COOKIELIST entry may
+     * still claim tail-matching for such a domain, so force it to be a
+     * host-only cookie instead of letting it act as a domain cookie.
+     */
+    cookie.tailmatch = FALSE;
+
   if(!iponly && !(flags & COOKIE_NOPSL) &&
      is_public_suffix(data, &cookie, domain))
     return result;
@@ -1462,41 +1471,56 @@ CURLcode Curl_cookie_getlist(struct Curl_easy *data,
 
   for(n = Curl_llist_head(&ci->cookielist[myhash]); n; n = Curl_node_next(n)) {
     struct Cookie *co = Curl_node_elem(n);
+    bool domain_match;
+    bool path_match;
 
     if(co->expires && (co->expires < now))
       continue;
 
-    /* if the cookie requires we are secure we must only continue if we are! */
-    if(co->secure ? secure : TRUE) {
+    /*
+     * Host scope (RFC 6265 5.1.3). An IP-literal cookie domain has no domain
+     * hierarchy and can therefore never be tail-matched: it must match the
+     * request host exactly, like a host-only cookie. This is checked against
+     * the cookie's own domain, not just the request host, so that a
+     * tail-matching cookie smuggled in for an IP address through a cookie
+     * file or CURLOPT_COOKIELIST cannot leak to another site.
+     */
+    if(!co->domain[0])
+      domain_match = TRUE;
+    else {
+      struct Curl_str cdomain;
+      bool cookie_is_ip;
+      curlx_str_assign(&cdomain, co->domain, strlen(co->domain));
+      cookie_is_ip = host_is_ipnum(&cdomain);
+      domain_match =
+        /* exact host-only match: host-only cookies and IP-literal domains */
+        ((is_ip || cookie_is_ip || !co->tailmatch) &&
+         curl_strequal(hostp, co->domain)) ||
+        /* domain (tail) match: only for non-IP, non-host-only cookies */
+        (co->tailmatch && !is_ip && !cookie_is_ip &&
+         cookie_tailmatch(co->domain, strlen(co->domain),
+                          curlx_str(&host), curlx_strlen(&host)));
+    }
 
-      /* now check if the domain is correct */
-      if(!co->domain[0] ||
-         (co->tailmatch && !is_ip &&
-          cookie_tailmatch(co->domain, strlen(co->domain),
-                           curlx_str(&host), curlx_strlen(&host))) ||
-         ((!co->tailmatch || is_ip) && curl_strequal(hostp, co->domain))) {
-        /*
-         * the right part of the host matches the domain stuff in the
-         * cookie data
-         */
+    /* Path boundary (RFC 6265 5.1.4) */
+    path_match = !co->path || pathmatch(co->path, path);
 
-        /*
-         * now check the left part of the path with the cookies path
-         * requirement
-         */
-        if(!co->path || pathmatch(co->path, path)) {
-
-          /*
-           * This is a match and we add it to the return-linked-list
-           */
-          Curl_llist_append(list, co, &co->getnode);
-          matches++;
-          if(matches >= MAX_COOKIE_SEND_AMOUNT) {
-            infof(data, "Included max number of cookies (%zu) in request!",
-                  matches);
-            break;
-          }
-        }
+    /*
+     * A cookie is sent only when the host scope, the path boundary and the
+     * secure-transport constraint all hold. A secure cookie is never sent
+     * over a non-secure context. The port is deliberately not part of the
+     * cookie scope.
+     */
+    if(domain_match && path_match && (co->secure ? secure : TRUE)) {
+      /*
+       * This is a match and we add it to the return-linked-list
+       */
+      Curl_llist_append(list, co, &co->getnode);
+      matches++;
+      if(matches >= MAX_COOKIE_SEND_AMOUNT) {
+        infof(data, "Included max number of cookies (%zu) in request!",
+              matches);
+        break;
       }
     }
   }
